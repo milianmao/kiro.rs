@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
@@ -30,7 +31,9 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
-      image: ${{ steps.meta.outputs.image }}
+      dockerhub_image: ${{ steps.meta.outputs.dockerhub_image }}
+      dockerhub_enabled: ${{ steps.meta.outputs.dockerhub_enabled }}
+      ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       target: ${{ steps.meta.outputs.target }}
     steps:
@@ -45,6 +48,7 @@ jobs:
           # job outputs would be redacted to an empty string when passed across jobs.
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           REPO_OWNER: ${{ github.repository_owner }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -79,11 +83,18 @@ jobs:
 
           TARGET="$(git rev-list -n 1 "${TAG}" 2>/dev/null || echo "${GITHUB_SHA}")"
 
-          NAMESPACE="${DOCKERHUB_NAMESPACE:-$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')}"
-
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
+          OWNER_LC="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "ghcr_image=ghcr.io/${OWNER_LC}/kiro-rs" >> "$GITHUB_OUTPUT"
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            NAMESPACE="${DOCKERHUB_NAMESPACE:-$OWNER_LC}"
+            echo "dockerhub_image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
+            echo "dockerhub_enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerhub_image=" >> "$GITHUB_OUTPUT"
+            echo "dockerhub_enabled=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
 
@@ -238,7 +249,7 @@ jobs:
             dist/*.zip
 
   build-images:
-    name: Build and push Docker Hub images
+    name: Build and push container images
     needs:
       - prepare
       - build-artifacts
@@ -278,12 +289,40 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Log in to Docker Hub
+        if: ${{ needs.prepare.outputs.dockerhub_enabled == 'true' }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         uses: docker/login-action@v3
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compose image tags
+        id: tags
+        env:
+          GHCR_IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+          DOCKERHUB_IMAGE: ${{ needs.prepare.outputs.dockerhub_image }}
+          DOCKERHUB_ENABLED: ${{ needs.prepare.outputs.dockerhub_enabled }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "${GHCR_IMAGE}:${VERSION}-${ARCH}"
+            if [ "$DOCKERHUB_ENABLED" = "true" ]; then
+              echo "${DOCKERHUB_IMAGE}:${VERSION}-${ARCH}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push arch image
         uses: docker/build-push-action@v6
@@ -297,20 +336,30 @@ jobs:
           cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
           push: true
           provenance: false
-          tags: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
             org.opencontainers.image.description=Kiro.rs Docker Image
 
   publish-image-manifest:
-    name: Publish Docker Hub manifest
+    name: Publish container image manifests
     needs:
       - prepare
       - build-images
     runs-on: ubuntu-latest
     steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Log in to Docker Hub
+        if: ${{ needs.prepare.outputs.dockerhub_enabled == 'true' }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         uses: docker/login-action@v3
         with:
           registry: docker.io
@@ -321,18 +370,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="${{ needs.prepare.outputs.image }}"
           VERSION="${{ needs.prepare.outputs.version }}"
+          GHCR_IMAGE="${{ needs.prepare.outputs.ghcr_image }}"
 
-          docker manifest create "${IMAGE}:${VERSION}" \
-            "${IMAGE}:${VERSION}-amd64" \
-            "${IMAGE}:${VERSION}-arm64"
-          docker manifest push "${IMAGE}:${VERSION}"
+          docker manifest create "${GHCR_IMAGE}:${VERSION}" \
+            "${GHCR_IMAGE}:${VERSION}-amd64" \
+            "${GHCR_IMAGE}:${VERSION}-arm64"
+          docker manifest push "${GHCR_IMAGE}:${VERSION}"
 
-          docker manifest create "${IMAGE}:latest" \
-            "${IMAGE}:${VERSION}-amd64" \
-            "${IMAGE}:${VERSION}-arm64"
-          docker manifest push "${IMAGE}:latest"
+          docker manifest create "${GHCR_IMAGE}:latest" \
+            "${GHCR_IMAGE}:${VERSION}-amd64" \
+            "${GHCR_IMAGE}:${VERSION}-arm64"
+          docker manifest push "${GHCR_IMAGE}:latest"
+
+          if [ "${{ needs.prepare.outputs.dockerhub_enabled }}" = "true" ]; then
+            DOCKERHUB_IMAGE="${{ needs.prepare.outputs.dockerhub_image }}"
+
+            docker manifest create "${DOCKERHUB_IMAGE}:${VERSION}" \
+              "${DOCKERHUB_IMAGE}:${VERSION}-amd64" \
+              "${DOCKERHUB_IMAGE}:${VERSION}-arm64"
+            docker manifest push "${DOCKERHUB_IMAGE}:${VERSION}"
+
+            docker manifest create "${DOCKERHUB_IMAGE}:latest" \
+              "${DOCKERHUB_IMAGE}:${VERSION}-amd64" \
+              "${DOCKERHUB_IMAGE}:${VERSION}-arm64"
+            docker manifest push "${DOCKERHUB_IMAGE}:latest"
+          fi
 
   publish-release:
     name: Publish GitHub Release
@@ -357,7 +420,9 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${{ needs.prepare.outputs.version }}"
-          IMAGE="${{ needs.prepare.outputs.image }}"
+          GHCR_IMAGE="${{ needs.prepare.outputs.ghcr_image }}"
+          DOCKERHUB_IMAGE="${{ needs.prepare.outputs.dockerhub_image }}"
+          DOCKERHUB_ENABLED="${{ needs.prepare.outputs.dockerhub_enabled }}"
 
           # 优先从 CHANGELOG.md 抽取当前版本的内容（使用 awk 匹配
           # `## [VERSION]` 到下一个 `## ` 之间的段落，去掉首行标题）
@@ -374,11 +439,12 @@ jobs:
 
           if [ ! -s RELEASE_NOTES.md ]; then
             cat > RELEASE_NOTES.md <<EOF
-          Docker image:
+          Container images:
 
           \`\`\`text
-          ${IMAGE}:${VERSION}
-          ${IMAGE}:latest
+          ${GHCR_IMAGE}:${VERSION}
+          ${GHCR_IMAGE}:latest
+          $(if [ "${DOCKERHUB_ENABLED}" = "true" ]; then printf '%s\n%s\n' "${DOCKERHUB_IMAGE}:${VERSION}" "${DOCKERHUB_IMAGE}:latest"; fi)
           \`\`\`
 
           Release assets include \`SHA256SUMS.txt\` for checksum verification.
@@ -388,11 +454,15 @@ jobs:
               echo
               echo "---"
               echo
-              echo "Docker image:"
+              echo "Container images:"
               echo
               echo '```text'
-              echo "${IMAGE}:${VERSION}"
-              echo "${IMAGE}:latest"
+              echo "${GHCR_IMAGE}:${VERSION}"
+              echo "${GHCR_IMAGE}:latest"
+              if [ "${DOCKERHUB_ENABLED}" = "true" ]; then
+                echo "${DOCKERHUB_IMAGE}:${VERSION}"
+                echo "${DOCKERHUB_IMAGE}:latest"
+              fi
               echo '```'
               echo
               echo "Release assets include \`SHA256SUMS.txt\` for checksum verification."
